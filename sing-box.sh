@@ -2,8 +2,8 @@
 
 # =========================
 # 老王sing-box四合一安装脚本
-# vless-version-reality|vmess-ws-tls(tunnel)|hysteria2|tuic5|[可额外添加Anytls，socks5，ss2022等协议] 
-# 最后更新时间: 2026.6.7[添加hy2证书, 添加ipv4和ipv6切换]
+# vless-version-reality|vless-ws-tls(tunnel)|vless-httpupgrade-tls(tunnel,固定隧道)|hysteria2|tuic5|[可额外添加Anytls，socks5，ss2022等协议]
+# 最后更新时间: 2026.11.17[移除过时VMess, Argo节点改为VLESS-WS, 新增VLESS-HTTPUpgrade(固定隧道), Hy2指纹改小写hex64, 新增SS_PORT环境变量]
 # =========================
 
 export LANG=en_US.UTF-8
@@ -30,6 +30,7 @@ export vless_port=${PORT:-$(shuf -i 1000-65000 -n 1)}
 export CFIP=${CFIP:-'cdns.doon.eu.org'} 
 export ARGO_PORT=${ARGO_PORT:-'8001'} 
 export CFPORT=${CFPORT:-'443'} 
+export SS_PORT=${SS_PORT:-''}           # Shadowsocks直连端口,留空则不开启;密钥由 UUID 稳定派生
 
 # 检查是否为root下运行
 [[ $EUID -ne 0 ]] && red "请在root用户下运行脚本，可输入 sudo -i 回车切换到root用户" && exit 1
@@ -37,6 +38,11 @@ export CFPORT=${CFPORT:-'443'}
 # 检查命令是否存在函数
 command_exists() {
     command -v "$1" >/dev/null 2>&1
+}
+
+# 由 UUID 稳定派生 SS2022 密钥: base64(sha256('ss-key:' + UUID) 前16字节)
+derive_ss_key() {
+    printf 'ss-key:%s' "$1" | openssl dgst -sha256 -binary 2>/dev/null | head -c 16 | base64 -w0 2>/dev/null
 }
 
 # 检查服务状态通用函数
@@ -244,18 +250,28 @@ install_singbox() {
     nginx_port=$(($vless_port + 1))
     tuic_port=$(($vless_port + 2))
     hy2_port=$(($vless_port + 3))
+    hu_port=$((${ARGO_PORT} + 1))
     uuid=$(cat /proc/sys/kernel/random/uuid)
     password=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 24)
     output=$(/etc/sing-box/sing-box generate reality-keypair)
     private_key=$(echo "${output}" | awk '/PrivateKey:/ {print $2}')
     public_key=$(echo "${output}" | awk '/PublicKey:/ {print $2}')
 
+    # SS2022 密钥由 UUID 稳定派生(仅 SS_PORT 设置时启用)
+    ss_key=""
+    if [ -n "$SS_PORT" ]; then
+        ss_key=$(derive_ss_key "$uuid")
+    fi
+
     allow_port $vless_port/tcp $nginx_port/tcp $tuic_port/udp $hy2_port/udp > /dev/null 2>&1
+    [ -n "$SS_PORT" ] && [ -n "$ss_key" ] && allow_port $SS_PORT/tcp $SS_PORT/udp > /dev/null 2>&1
 
     openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
     openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
-    
-    fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
+
+    # Hy2 证书指纹:小写 hex64、无冒号(新版 V2RayN 要求;冒号格式会在 pinnedPeerCertSha256 处报 encoding/hex 错误)
+    fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" 2>/dev/null | cut -d'=' -f2 | tr -d ':' | tr 'A-Z' 'a-z')
+    [[ "$fingerprint" =~ ^[0-9a-f]{64}$ ]] || fingerprint=""
     
     dns_strategy=$(ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1 && echo "prefer_ipv4" || \
         (ping -c 1 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && echo "prefer_ipv6" || echo "prefer_ipv4"))
@@ -325,8 +341,8 @@ EOF
       }
     },
     {
-      "type": "vmess",
-      "tag": "vmess-ws",
+      "type": "vless",
+      "tag": "vless-ws",
       "listen": "::",
       "listen_port": ${ARGO_PORT},
       "users": [
@@ -336,8 +352,23 @@ EOF
       ],
       "transport": {
         "type": "ws",
-        "path": "/vmess-argo",
+        "path": "/vless-argo",
         "early_data_header_name": "Sec-WebSocket-Protocol"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-httpupgrade",
+      "listen": "127.0.0.1",
+      "listen_port": $hu_port,
+      "users": [
+        {
+          "uuid": "$uuid"
+        }
+      ],
+      "transport": {
+        "type": "httpupgrade",
+        "path": "/vless-httpupgrade-argo"
       }
     },
     {
@@ -379,7 +410,16 @@ EOF
         "certificate_path": "$work_dir/cert.pem",
         "key_path": "$work_dir/private.key"
       }
-    }
+    }$(if [ -n "$SS_PORT" ] && [ -n "$ss_key" ]; then echo ',
+    {
+      "type": "shadowsocks",
+      "tag": "shadowsocks-2022",
+      "listen": "::",
+      "listen_port": '${SS_PORT}',
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "'${ss_key}'",
+      "multiplex": {"enabled": true}
+    }'; fi)
   ]
 }
 EOF
@@ -549,21 +589,38 @@ get_info() {
 
     green "\nArgoDomain：${purple}$argodomain${re}\n"
 
-    VMESS="{ \"v\": \"2\", \"ps\": \"${isp}\", \"add\": \"${CFIP}\", \"port\": \"${CFPORT}\", \"id\": \"${uuid}\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"firefox\", \"allowInsecure\": \"false\"}"
+    # Hy2 指纹参数:算不出指纹时只带 insecure=1,不输出空 pinSHA256
+    pin_param=""
+    [ -n "$fingerprint" ] && pin_param="&pinSHA256=${fingerprint}"
+
+    # SS 直连链接(仅 SS_PORT 设置时生成;密钥与服务端一致,由 UUID 派生)
+    ss_link=""
+    if [ -n "$SS_PORT" ] && [ -n "$ss_key" ]; then
+        ss_userinfo=$(printf '%s:%s' "2022-blake3-aes-128-gcm" "${ss_key}" | base64 -w0)
+        ss_link="ss://${ss_userinfo}@${server_ip}:${SS_PORT}#${isp}"
+    fi
 
     extra_lines=""
     if [ -f "${client_dir}" ]; then
-        extra_lines=$(grep -vE '^(vless://|vmess://|hysteria2://|tuic://)' "${client_dir}" || true)
+        # SS_PORT 设置时主链接里已有 ss://,需从保留行中排除以免重复;否则菜单后加的 ss 链接要保留
+        if [ -n "$SS_PORT" ]; then
+            extra_lines=$(grep -vE '^(vless://|ss://|hysteria2://|tuic://)' "${client_dir}" || true)
+        else
+            extra_lines=$(grep -vE '^(vless://|hysteria2://|tuic://)' "${client_dir}" || true)
+        fi
     fi
 
+    # HTTPUpgrade 链接不在此生成:安装时一律是临时隧道(--url 只转发一个端口,无法路由第二路);
+    # 切到固定隧道后由 change_argo_domain 添加,切回临时隧道时由其移除
     cat > ${work_dir}/url.txt << EOF
 vless://${uuid}@${server_ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk=${public_key}&type=tcp&headerType=none#${isp}
 
-vmess://$(echo "$VMESS" | base64 -w0)
+vless://${uuid}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=firefox&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${isp}
 
-hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none#${isp}
+hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=www.bing.com&insecure=1${pin_param}&alpn=h3&obfs=none#${isp}
 
 tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${isp}
+${ss_link}
 EOF
 
     if [ -n "$extra_lines" ]; then
@@ -678,8 +735,8 @@ get_current_uuid() {
     local inbounds_file="${conf_dir}/inbounds.json"
     if [ -f "$inbounds_file" ]; then
         local uuid
-        uuid=$(jq -r '.inbounds[] | select(.type == "vless") | .users[0].uuid // empty' "$inbounds_file" 2>/dev/null | head -1)
-        [ -z "$uuid" ] && uuid=$(jq -r '.inbounds[] | select(.type == "vmess") | .users[0].uuid // empty' "$inbounds_file" 2>/dev/null | head -1)
+        uuid=$(jq -r '.inbounds[] | select(.tag == "vless-reality") | .users[0].uuid // empty' "$inbounds_file" 2>/dev/null | head -1)
+        [ -z "$uuid" ] && uuid=$(jq -r '.inbounds[] | select(.tag == "vless-ws") | .users[0].uuid // empty' "$inbounds_file" 2>/dev/null | head -1)
         [ -z "$uuid" ] && uuid=$(jq -r '.inbounds[] | select(.type == "hysteria2") | .users[0].password // empty' "$inbounds_file" 2>/dev/null | head -1)
         echo "$uuid"
     fi
@@ -877,7 +934,7 @@ change_config() {
     skyblue "------------"
     green "5. 删除hysteria2端口跳跃"
     skyblue "------------"
-    green "6. 修改vmess-argo优选域名"
+    green "6. 修改vless-argo优选域名"
     skyblue "------------"
     green "7. 修改节点ip为ipv4"
     skyblue "------------"
@@ -895,7 +952,7 @@ change_config() {
             skyblue "------------"
             green "3. 修改tuic端口"
             skyblue "------------"
-            green "4. 修改vmess-argo端口"
+            green "4. 修改vless-argo端口"
             skyblue "------------"
             purple "0. 返回上一级菜单"
             skyblue "------------"
@@ -906,11 +963,11 @@ change_config() {
                     reading "\n请输入vless-reality端口 (回车跳过将使用随机端口): " new_port
                     [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
                     jq --arg port "$new_port" \
-                       '(.inbounds[] | select(.type == "vless").listen_port) = ($port | tonumber)' \
+                       '(.inbounds[] | select(.tag == "vless-reality").listen_port) = ($port | tonumber)' \
                        "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
                     restart_singbox
                     allow_port $new_port/tcp > /dev/null 2>&1
-                    sed -i 's/\(vless:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
+                    sed -i '/flow=xtls-rprx-vision/s/\(vless:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
                     base64 -w0 /etc/sing-box/url.txt > /etc/sing-box/sub.txt
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
                     green "\nvless-reality端口已修改成：${purple}$new_port${re}\n"
@@ -942,10 +999,10 @@ change_config() {
                     green "\ntuic端口已修改为：${purple}${new_port}${re}\n"
                     ;;
                 4)
-                    reading "\n请输入vmess-argo端口 (回车跳过将使用随机端口): " new_port
+                    reading "\n请输入vless-argo端口 (回车跳过将使用随机端口): " new_port
                     [ -z "$new_port" ] && new_port=$(shuf -i 2000-65000 -n 1)
                     jq --arg port "$new_port" \
-                       '(.inbounds[] | select(.type == "vmess").listen_port) = ($port | tonumber)' \
+                       '(.inbounds[] | select(.tag == "vless-ws").listen_port) = ($port | tonumber)' \
                        "$inbounds_file" > "${inbounds_file}.tmp" && mv "${inbounds_file}.tmp" "$inbounds_file"
                     allow_port $new_port/tcp > /dev/null 2>&1
                     if command_exists rc-service; then
@@ -958,7 +1015,7 @@ change_config() {
                             get_quick_tunnel && change_argo_domain
                     fi
                     restart_singbox
-                    green "\nvmess-argo端口已修改为：${purple}${new_port}${re}\n"
+                    green "\nvless-argo端口已修改为：${purple}${new_port}${re}\n"
                     ;;
                 0) change_config ;;
                 *) red "无效的选项，请输入 1 到 4" ;;
@@ -967,19 +1024,30 @@ change_config() {
         2)
             reading "\n请输入新的UUID(直接回车随机生成UUID): " new_uuid
             [ -z "$new_uuid" ] && new_uuid=$(cat /proc/sys/kernel/random/uuid)
+            old_uuid=$(get_current_uuid)
             jq --arg uuid "$new_uuid" \
                '(.inbounds[] | select(.users != null) | .users[] | select(.uuid != null).uuid) = $uuid |
                 (.inbounds[] | select(.users != null) | .users[] | select(.password != null).password) = $uuid' \
                "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp" && mv "${conf_dir}/inbounds.json.tmp" "${conf_dir}/inbounds.json"
+            # SS2022 密钥若由旧 UUID 派生(安装时 SS_PORT 开启),需随 UUID 重新派生;菜单后加的随机密钥不动
+            ss_link_update=0
+            if jq -e '.inbounds[] | select(.tag == "shadowsocks-2022")' "${conf_dir}/inbounds.json" > /dev/null 2>&1; then
+                old_ss_key=$(derive_ss_key "$old_uuid")
+                cur_ss_key=$(jq -r '.inbounds[] | select(.tag == "shadowsocks-2022") | .password' "${conf_dir}/inbounds.json")
+                if [ -n "$old_ss_key" ] && [ "$old_ss_key" = "$cur_ss_key" ]; then
+                    new_ss_key=$(derive_ss_key "$new_uuid")
+                    ss_method=$(jq -r '.inbounds[] | select(.tag == "shadowsocks-2022") | .method' "${conf_dir}/inbounds.json")
+                    jq --arg key "$new_ss_key" \
+                       '(.inbounds[] | select(.tag == "shadowsocks-2022") | .password) = $key' \
+                       "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp" && mv "${conf_dir}/inbounds.json.tmp" "${conf_dir}/inbounds.json"
+                    new_ss_userinfo=$(printf '%s:%s' "${ss_method}" "${new_ss_key}" | base64 -w0)
+                    ss_link_update=1
+                fi
+            fi
             restart_singbox
             sed -i -E 's/(vless:\/\/|hysteria2:\/\/|anytls:\/\/)[^@]*(@.*)/\1'"$new_uuid"'\2/' $client_dir
             sed -i -E "s#tuic://[0-9a-f-]{36}:[0-9a-f-]{36}@#tuic://$new_uuid:$new_uuid@#g" $client_dir
-            isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
-                awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | sed 's/ /_/g' || echo "$hostname")
-            argodomain=$(grep -oE 'https://[[:alnum:]+\.-]+\.trycloudflare\.com' "${work_dir}/argo.log" | sed 's@https://@@')
-            VMESS="{ \"v\": \"2\", \"ps\": \"${isp}\", \"add\": \"${CFIP}\", \"port\": \"443\", \"id\": \"${new_uuid}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"\", \"allowInsecure\": \"false\"}"
-            encoded_vmess=$(echo "$VMESS" | base64 -w0)
-            sed -i -E '/vmess:\/\//{s@vmess://.*@vmess://'"$encoded_vmess"'@}' $client_dir
+            [ "$ss_link_update" -eq 1 ] && sed -i -E 's#^(ss://)[^@]*@#\1'"$new_ss_userinfo"'@#' $client_dir
             base64 -w0 $client_dir > /etc/sing-box/sub.txt
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             green "\nUUID已修改为：${purple}${new_uuid}${re}\n"
@@ -996,11 +1064,11 @@ change_config() {
                 "5") new_sni="www.nazhumi.com" ;;
             esac
             jq --arg sni "$new_sni" \
-               '(.inbounds[] | select(.type == "vless") | .tls.server_name) = $sni |
-                (.inbounds[] | select(.type == "vless") | .tls.reality.handshake.server) = $sni' \
+               '(.inbounds[] | select(.tag == "vless-reality") | .tls.server_name) = $sni |
+                (.inbounds[] | select(.tag == "vless-reality") | .tls.reality.handshake.server) = $sni' \
                "${conf_dir}/inbounds.json" > "${conf_dir}/inbounds.json.tmp" && mv "${conf_dir}/inbounds.json.tmp" "${conf_dir}/inbounds.json"
             restart_singbox
-            sed -i "s/\(vless:\/\/[^\?]*\?\([^\&]*\&\)*sni=\)[^&]*/\1$new_sni/" $client_dir
+            sed -i "/flow=xtls-rprx-vision/s/\(vless:\/\/[^\?]*\?\([^\&]*\&\)*sni=\)[^&]*/\1$new_sni/" $client_dir
             base64 -w0 $client_dir > /etc/sing-box/sub.txt
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             green "\nReality sni已修改为：${purple}${new_sni}${re}\n"
@@ -1039,13 +1107,15 @@ IEOF
             fi
             restart_singbox
             ip=$(get_realip)
-            fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
+            fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" 2>/dev/null | cut -d'=' -f2 | tr -d ':' | tr 'A-Z' 'a-z')
+            [[ "$fingerprint" =~ ^[0-9a-f]{64}$ ]] || fingerprint=""
+            pin_param=""; [ -n "$fingerprint" ] && pin_param="&pinSHA256=${fingerprint}"
             uuid=$(sed -n 's/.*hysteria2:\/\/\([^@]*\)@.*/\1/p' $client_dir)
             line_number=$(grep -n 'hysteria2://' $client_dir | cut -d':' -f1)
             isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
                 awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | sed 's/ /_/g' || echo "$hostname")
             sed -i.bak "/hysteria2:/d" $client_dir
-            sed -i "${line_number}i hysteria2://$uuid@$ip:$listen_port?peer=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none&mport=$listen_port,$min_port-$max_port#$isp" $client_dir
+            sed -i "${line_number}i hysteria2://$uuid@$ip:$listen_port?peer=www.bing.com&insecure=1${pin_param}&alpn=h3&obfs=none&mport=$listen_port,$min_port-$max_port#$isp" $client_dir
             base64 -w0 $client_dir > /etc/sing-box/sub.txt
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             green "\nhysteria2端口跳跃已开启：${purple}$min_port-$max_port${re}\n"
@@ -1081,8 +1151,9 @@ IEOF
                 red "\n当前服务器的ipv4: $new_ipv4 为warp ip,无法作为直连节点使用\n"
                 return 1
             fi
-            if grep -Eq '^(vless|hysteria2|tuic|anytls|socks|ss)://[^@]+@\[[0-9a-fA-F:]+\]' "$client_dir"; then
-                sed -i -E "/^(vless|hysteria2|tuic|anytls|socks|ss):\/\// s#@\[[0-9a-fA-F:]+\]#@${new_ipv4}#g" "$client_dir"
+            if grep -Ev 'vless(-httpupgrade)?-argo' "$client_dir" | grep -Eq '^(vless|hysteria2|tuic|anytls|socks|ss)://[^@]+@\[[0-9a-fA-F:]+\]'; then
+                # Argo 链接的 host 是 CF 优选域名/IP,不是服务器 IP,切换时必须排除
+                sed -i -E "/^(vless|hysteria2|tuic|anytls|socks|ss):\/\// {/vless(-httpupgrade)?-argo/! s#@\[[0-9a-fA-F:]+\]#@${new_ipv4}#g}" "$client_dir"
                 green "\n已将 IPv6 修改为 IPv4: $new_ipv4 可复制以下节点或更新订阅\n"
                 check_nodes
             else
@@ -1105,8 +1176,9 @@ IEOF
                 red "\n当前服务器的ipv6 $new_ipv6 为warp ip,无法作为直连节点使用\n"
                 return 1
             fi
-            if grep -Eq '^(vless|hysteria2|tuic|anytls|socks|ss)://[^@]+@([0-9]{1,3}\.){3}[0-9]{1,3}' "$client_dir"; then
-                sed -i -E "/^(vless|hysteria2|tuic|anytls|socks|ss):\/\// s#@(([0-9]{1,3}\.){3}[0-9]{1,3})#@[${new_ipv6}]#g" "$client_dir"
+            if grep -Ev 'vless(-httpupgrade)?-argo' "$client_dir" | grep -Eq '^(vless|hysteria2|tuic|anytls|socks|ss)://[^@]+@([0-9]{1,3}\.){3}[0-9]{1,3}'; then
+                # Argo 链接的 host 是 CF 优选域名/IP,不是服务器 IP,切换时必须排除
+                sed -i -E "/^(vless|hysteria2|tuic|anytls|socks|ss):\/\// {/vless(-httpupgrade)?-argo/! s#@(([0-9]{1,3}\.){3}[0-9]{1,3})#@[${new_ipv6}]#g}" "$client_dir"
                 green "\n已将 IPv4 修改为 IPv6: [${new_ipv6}] 可复制以下节点或更新订阅\n"
                 check_nodes
             else
@@ -1257,7 +1329,7 @@ manage_argo() {
             ;;
         4)
             clear
-            yellow "\n固定隧道可为json或token，固定隧道端口为8001, 使用token请在cloudflare里设置一致\njson获取地址：${purple}https://fscarmen.cloudflare.now.cc${re}\n"
+            yellow "\n固定隧道可为json或token，固定隧道端口为${ARGO_PORT}, 使用token请在cloudflare里设置一致\nHTTPUpgrade 节点需在同一域名上再加一条路径规则: Path 为 /vless-httpupgrade-argo, 指向 http://localhost:$((${ARGO_PORT} + 1))\njson获取地址：${purple}https://fscarmen.cloudflare.now.cc${re}\n"
             reading "\n请输入你的argo域名: " argo_domain
             ArgoDomain=$argo_domain
             reading "\n请输入你的argo密钥(token或json): " argo_auth
@@ -1270,7 +1342,12 @@ protocol: http2
 
 ingress:
   - hostname: $ArgoDomain
-    service: http://localhost:8001
+    path: ^/vless-httpupgrade-argo
+    service: http://localhost:$((${ARGO_PORT} + 1))
+    originRequest:
+      noTLSVerify: true
+  - hostname: $ArgoDomain
+    service: http://localhost:${ARGO_PORT}
     originRequest:
       noTLSVerify: true
   - service: http_status:404
@@ -1334,19 +1411,25 @@ get_quick_tunnel() {
 
 # 更新Argo域名到订阅
 change_argo_domain() {
-    content=$(cat "$client_dir")
-    vmess_url=$(grep -o 'vmess://[^ ]*' "$client_dir")
-    vmess_prefix="vmess://"
-    encoded_vmess="${vmess_url#"$vmess_prefix"}"
-    decoded_vmess=$(echo "$encoded_vmess" | base64 --decode)
-    updated_vmess=$(echo "$decoded_vmess" | jq --arg new_domain "$ArgoDomain" '.host = $new_domain | .sni = $new_domain')
-    encoded_updated_vmess=$(echo "$updated_vmess" | base64 | tr -d '\n')
-    new_vmess_url="${vmess_prefix}${encoded_updated_vmess}"
-    new_content=$(echo "$content" | sed "s|$vmess_url|$new_vmess_url|")
-    echo "$new_content" > "$client_dir"
+    # VLESS-WS 与 HTTPUpgrade 链接的 sni/host 参数都指向 Argo 域名,一起更新
+    sed -i -E '/vless(-httpupgrade)?-argo/s/(sni=)[^&]*/\1'"$ArgoDomain"'/; /vless(-httpupgrade)?-argo/s/(host=)[^&]*/\1'"$ArgoDomain"'/' "$client_dir"
+    if [[ "$ArgoDomain" == *.trycloudflare.com ]]; then
+        # 临时隧道只能转发一个端口,HTTPUpgrade 链接无法路由,移除以免订阅里留死节点
+        sed -i '/vless-httpupgrade-argo/d' "$client_dir"
+    else
+        # 固定隧道:确保 HTTPUpgrade 链接存在(路径规则在 tunnel.yml 或 Cloudflare 后台)
+        if ! grep -q 'vless-httpupgrade-argo' "$client_dir"; then
+            ws_line=$(grep 'vless-argo' "$client_dir" | grep -v 'httpupgrade' | head -1)
+            hu_uuid=$(echo "$ws_line" | sed -n 's|.*vless://\([^@]*\)@.*|\1|p')
+            hu_authority=$(echo "$ws_line" | sed -n 's|.*vless://[^@]*@\([^?]*\)?.*|\1|p')
+            hu_isp=$(echo "$ws_line" | sed -n 's|.*#\(.*\)|\1|p')
+            hu_link="vless://${hu_uuid}@${hu_authority}?encryption=none&security=tls&sni=${ArgoDomain}&fp=firefox&type=httpupgrade&host=${ArgoDomain}&path=%2Fvless-httpupgrade-argo#${hu_isp}-HTTPUpgrade"
+            sed -i "/vless-argo/a ${hu_link}" "$client_dir"
+        fi
+    fi
     base64 -w0 ${work_dir}/url.txt > ${work_dir}/sub.txt
-    green "vmess节点已更新\n"
-    purple "$new_vmess_url\n"
+    green "vless-argo节点已更新\n"
+    grep -E 'vless(-httpupgrade)?-argo' "$client_dir" | while IFS= read -r line; do purple "$line\n"; done
 }
 
 # 查看节点信息和订阅链接
@@ -1394,7 +1477,7 @@ check_nodes() {
 
 change_cfip() {
     clear
-    yellow "修改vmess-argo优选域名\n"
+    yellow "修改vless-argo优选域名\n"
     green "1: cf.090227.xyz  2: cf.877774.xyz  3: cf.877771.xyz  4: cdns.doon.eu.org  5: cf.zhetengsha.eu.org  6: time.is\n"
     reading "请输入你的优选域名或优选IP\n(请输入1至6选项,可输入域名:端口 或 IP:端口,直接回车默认使用1): " cfip_input
 
@@ -1415,18 +1498,11 @@ change_cfip() {
             ;;
     esac
 
-    content=$(cat "$client_dir")
-    vmess_url=$(grep -o 'vmess://[^ ]*' "$client_dir")
-    encoded_part="${vmess_url#vmess://}"
-    decoded_json=$(echo "$encoded_part" | base64 --decode 2>/dev/null)
-    updated_json=$(echo "$decoded_json" | jq --arg cfip "$cfip" --argjson cfport "$cfport" '.add = $cfip | .port = $cfport')
-    new_encoded_part=$(echo "$updated_json" | base64 -w0)
-    new_vmess_url="vmess://$new_encoded_part"
-    new_content=$(echo "$content" | sed "s|$vmess_url|$new_vmess_url|")
-    echo "$new_content" > "$client_dir"
+    # VLESS-WS 与 HTTPUpgrade 链接的优选域名/端口都在 authority 段,一起更新
+    sed -i -E '/vless(-httpupgrade)?-argo/s#(vless://[^@]*@)[^?]*#\1'"$cfip:$cfport"'#' "$client_dir"
     base64 -w0 "${work_dir}/url.txt" > "${work_dir}/sub.txt"
-    green "\nvmess节点优选域名已更新为：${purple}${cfip}:${cfport}${re}\n"
-    purple "$new_vmess_url\n"
+    green "\nvless-argo节点优选域名已更新为：${purple}${cfip}:${cfport}${re}\n"
+    grep -E 'vless(-httpupgrade)?-argo' "$client_dir" | while IFS= read -r line; do purple "$line\n"; done
 }
 
 # WARP 分流管理

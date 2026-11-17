@@ -42,6 +42,11 @@ func startHTTPServer() {
 }
 
 func rootHandler(w http.ResponseWriter, r *http.Request) {
+	if content, err := ioutil.ReadFile("index.html"); err == nil {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(content)
+		return
+	}
 	fmt.Fprint(w, "Hello, World!")
 }
 

@@ -102,10 +102,11 @@ else
     udp_port2=$(echo "$udp_ports" | sed -n '2p')
 fi
 
-export VMESS_PORT=$tcp_port
+export VLESS_PORT=$tcp_port
+export HU_PORT=$((tcp_port + 1))
 export TUIC_PORT=$udp_port1
 export HY2_PORT=$udp_port2
-purple "vmess-argo使用的tcp端口: $tcp_port"
+purple "vless-argo使用的tcp端口: $tcp_port"
 purple "tuic和hy2分别使用的UDP端口: $udp_port1 和 $udp_port2"
 }
 
@@ -148,13 +149,18 @@ protocol: http2
 
 ingress:
   - hostname: $ARGO_DOMAIN
-    service: http://localhost:$VMESS_PORT
+    path: ^/vless-httpupgrade-argo
+    service: http://localhost:$HU_PORT
+    originRequest:
+      noTLSVerify: true
+  - hostname: $ARGO_DOMAIN
+    service: http://localhost:$VLESS_PORT
     originRequest:
       noTLSVerify: true
   - service: http_status:404
 EOF
   else
-    green "ARGO_AUTH mismatch TunnelSecret,use token connect to tunnel"
+    green "ARGO_AUTH mismatch TunnelSecret,use token connect to tunnel; set tunnel port to $VLESS_PORT in cloudflare, and add a path rule for /vless-httpupgrade-argo to http://localhost:$HU_PORT"
   fi
 }
 
@@ -177,12 +183,13 @@ cat > config.json <<EOF
    "dns": {
     "servers": [
       {
-        "address": "8.8.8.8",
-        "address_resolver": "local"
+        "tag": "google",
+        "type": "udp",
+        "server": "8.8.8.8"
       },
       {
         "tag": "local",
-        "address": "local"
+        "type": "local"
       }
     ]
   },
@@ -206,10 +213,10 @@ cat > config.json <<EOF
       }
     },
     {
-      "tag": "vmess-ws-in",
-      "type": "vmess",
+      "tag": "vless-ws-in",
+      "type": "vless",
       "listen": "::",
-      "listen_port": $VMESS_PORT,
+      "listen_port": $VLESS_PORT,
       "users": [
         {
           "uuid": "$UUID"
@@ -217,8 +224,23 @@ cat > config.json <<EOF
       ],
       "transport": {
         "type": "ws",
-        "path": "/vmess-argo",
+        "path": "/vless-argo",
         "early_data_header_name": "Sec-WebSocket-Protocol"
+      }
+    },
+    {
+      "tag": "vless-httpupgrade-in",
+      "type": "vless",
+      "listen": "127.0.0.1",
+      "listen_port": $HU_PORT,
+      "users": [
+        {
+          "uuid": "$UUID"
+        }
+      ],
+      "transport": {
+        "type": "httpupgrade",
+        "path": "/vless-httpupgrade-argo"
       }
     },
     {
@@ -416,7 +438,7 @@ if [ -e "$(basename ${FILE_MAP[bot]})" ]; then
     elif [[ $ARGO_AUTH =~ TunnelSecret ]]; then
       args="tunnel --edge-ip-version auto --config tunnel.yml run"
     else
-      args="tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile boot.log --loglevel info --url http://localhost:$VMESS_PORT"
+      args="tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile boot.log --loglevel info --url http://localhost:$VLESS_PORT"
     fi
     nohup ./"$(basename ${FILE_MAP[bot]})" $args >/dev/null 2>&1 &
     sleep 2
@@ -529,19 +551,31 @@ ISP=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | awk -F
 get_name() { if [ "$HOSTNAME" = "s1.ct8.pl" ]; then SERVER="CT8"; else SERVER=$(echo "$HOSTNAME" | cut -d '.' -f 1); fi; echo "$SERVER"; }
 NAME="$ISP-$(get_name)"
 
+# Hy2 证书指纹:小写 hex64、无冒号(新版 V2RayN 要求);算不出时链接只带 insecure=1
+HY2_FINGERPRINT=$(openssl x509 -noout -fingerprint -sha256 -in cert.pem 2>/dev/null | cut -d'=' -f2 | tr -d ':' | tr 'A-Z' 'a-z')
+[[ "$HY2_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] || HY2_FINGERPRINT=""
+HY2_PIN_PARAM=""; [ -n "$HY2_FINGERPRINT" ] && HY2_PIN_PARAM="&pinSHA256=${HY2_FINGERPRINT}"
+
+# HTTPUpgrade 只在固定隧道下生成:临时隧道(--url)只能转发一个端口,无法路由第二路
+hu_link=""
+if [[ -n $ARGO_AUTH ]]; then
+  hu_link="vless://$UUID@$CFIP:$CFPORT?encryption=none&security=tls&sni=$argodomain&fp=firefox&type=httpupgrade&host=$argodomain&path=%2Fvless-httpupgrade-argo#$NAME-vless-argo-HTTPUpgrade"
+fi
+
 yellow "注意：v2ray或其他软件的跳过证书验证需设置为true,否则hy2或tuic节点可能不通\n"
 cat > ${FILE_PATH}/list.txt <<EOF
-vmess://$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-vmss\", \"add\": \"$available_ip\", \"port\": \"$VMESS_PORT\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"\", \"path\": \"/vmess-argo?ed=2048\", \"tls\": \"\", \"sni\": \"\", \"alpn\": \"\", \"fp\": \"\"}" | base64 -w0)
+vless://$UUID@$available_ip:$VLESS_PORT?encryption=none&security=none&type=ws&path=%2Fvless-argo%3Fed%3D2048#$NAME-vless
 
-vmess://$(echo "{ \"v\": \"2\", \"ps\": \"$NAME-vmss-argo\", \"add\": \"$CFIP\", \"port\": \"$CFPORT\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$argodomain\", \"path\": \"/vmess-argo?ed=2048\", \"tls\": \"tls\", \"sni\": \"$argodomain\", \"alpn\": \"\", \"fp\": \"\"}" | base64 -w0)
+vless://$UUID@$CFIP:$CFPORT?encryption=none&security=tls&sni=$argodomain&fp=firefox&type=ws&host=$argodomain&path=%2Fvless-argo%3Fed%3D2048#$NAME-vless-argo
+${hu_link}
 
-hysteria2://$UUID@$available_ip:$HY2_PORT/?sni=www.bing.com&alpn=h3&insecure=1#$NAME-hy2
+hysteria2://$UUID@$available_ip:$HY2_PORT/?sni=www.bing.com&insecure=1&alpn=h3${HY2_PIN_PARAM}#$NAME-hy2
 
 tuic://$UUID:admin123@$available_ip:$TUIC_PORT?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#$NAME-tuic
 EOF
 cat ${FILE_PATH}/list.txt
 generate_sub_link
-yellow "\nServ00|ct8老王sing-box一键四协议安装脚本(vmess-ws|vmess-ws-tls(argo)|hysteria2|tuic)\n"
+yellow "\nServ00|ct8老王sing-box一键四协议安装脚本(vless-ws|vless-ws-tls(argo)|vless-httpupgrade(argo,固定隧道)|hysteria2|tuic)\n"
 echo -e "${green}issues反馈：${re}${yellow}https://github.com/eooce/Sing-box/issues${re}\n"
 echo -e "${green}反馈论坛：${re}${yellow}https://bbs.vps8.me${re}\n"
 echo -e "${green}TG反馈群组：${re}${yellow}https://t.me/vps888${re}\n"

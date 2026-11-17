@@ -11,7 +11,7 @@
 [![PyPI](https://img.shields.io/badge/PyPI-3775A9?logo=pypi&logoColor=white)](https://pypi.org/project/singbox)
 [![Docker](https://img.shields.io/badge/Docker-2496ED?&logo=docker&logoColor=white)](https://hub.docker.com/r/eooce/sbx)
 
-sing-box是一个强大的代理脚本，多种环境下使用。它支持多种代理协议（VLESS-reality-verison、VMess-ws-tls(tunnel)、Hysteria2、Tuic），并集成了哪吒(v0/v1)探针功能。
+sing-box是一个强大的代理脚本，多种环境下使用。它支持多种代理协议（VLESS-reality-version、VLESS-ws-tls(tunnel)、VLESS-httpupgrade-tls(tunnel,固定隧道)、Hysteria2、Tuic），并集成了哪吒(v0/v1)探针功能。
 
 ---
 
@@ -23,7 +23,8 @@ Telegram交流反馈群组：https://t.me/eooceu
 # 1：vps一键命令，已集成到ssh工具箱中
 * 注意nat小鸡安装完一键脚本之后需手动更改订阅端口和节点端口在允许范围内的端口，否则节点不通
 * 可在脚本前添加PORT变量，随脚本一起运行，即可定义端口，需确保PORT端口后面的3个端口可用，否则节点不通
-* 可选环境变量PORT CFIP CFPORT
+* 可选环境变量PORT CFIP CFPORT SS_PORT（SS_PORT为Shadowsocks直连端口，留空不开启）
+* Argo节点为VLESS-WS；固定隧道下订阅另含VLESS-HTTPUpgrade节点（临时隧道只能转发一个端口，无法路由，不生成）
 
 ## VPS一键四协议安装脚本
 ```
@@ -54,20 +55,20 @@ bash <(curl -Ls ssh_tool.eooce.com)
 
 # 2：Serv00|CT8一键安装脚本,集成哪吒探针,全自动安装
 * 官方更新的[ToS](https://forum.serv00.com/d/2787-april-cleaning-and-new-tos),自行斟酌是否安装
-* 一键四协议安装脚本，vmess-ws|vmess-ws-tls(argo)|hy2|tuic5默认解锁GPT和奈飞
+* 一键四协议安装脚本，vless-ws|vless-ws-tls(argo)|vless-httpupgrade(argo,固定隧道)|hy2|tuic5默认解锁GPT和奈飞
 * 支持自定义哪吒参数、Argo等参数随脚本一起运行
 * 列如：UUID=123456 ARGO_DOMAIN=2go.admin.com ARGO_AUTH=abc123 UPLOAD_URL=https://merge.serv00.net
 * v0哪吒变量形式:NEZHA_SERVER=nezha.abc.com  v1哪吒变量形式:NEZHA_SERVER=nezha.abc.com:8008,v1不需要NEZHA_PORT变量
 * 需要订阅自动上传到汇聚订阅器，需先部署Merge-sub项目，部署时填写UPLOAD_URL环境变量为部署的首页地址,例如：UPLOAD_URL=https://merge.serv00.net
 * 客户端跳过证书验证需设置为true，否则hy2和tuic不通
 
-## Serv00|CT8一键四协议安装脚本vmess-ws|vmess-ws-tls(argo)|hy2|tuic5
+## Serv00|CT8一键四协议安装脚本vless-ws|vless-ws-tls(argo)|hy2|tuic5
 * 交互式4合1中加入全自动保活服务,只安装1没有保活，安装1和2或者直接安装2
 ```
 bash <(curl -Ls https://raw.githubusercontent.com/eooce/sing-box/main/sb_serv00.sh)
 ```
 
-## Serv00|CT8一键四协议无交互安装脚本vmess-ws|vmess-ws-tls(argo)|hy2|tuic5，全自动安装节点+全自动保活
+## Serv00|CT8一键四协议无交互安装脚本vless-ws|vless-ws-tls(argo)|hy2|tuic5，全自动安装节点+全自动保活
 * 默认不安装哪吒和TG提醒，如需要，在脚本前添加环境变量随脚本一起运行即可
 * 可选环境变量：CHAT_ID BOT_TOKEN UUID NEZHA_SERVER NEZHA_PORT NEZHA_KEY ARGO_DOMAIN ARGO_AUTH CFIP CFPORT SUB_TOKEN
 * v0哪吒变量形式:NEZHA_SERVER=nezha.abc.com  v1哪吒变量形式:NEZHA_SERVER=nezha.abc.com:8008,v1不需要NEZHA_PORT变量
@@ -123,7 +124,7 @@ bash <(curl -Ls https://github.com/eooce/Sing-box/releases/download/00/00_vm.sh)
 # 3：游戏机hosting
 ## sing-box玩具四合一，默认解锁GPT和奈飞
 * node,python,java,go环境的游戏玩具搭建singbox节点，集成哪吒探针服务
-* 玩具默认vmess-argo ，支持多端口的玩具可自行添加端口变量同时开启4协议节点
+* 玩具默认vless-argo（固定隧道下另有vless-httpupgrade-argo），支持多端口的玩具可自行添加端口变量同时开启多协议节点
 * 对应文件夹即对应环境请下载对应文件夹里的文件上传并赋予权限，修改变量后运行
 * ARGO_DOMAIN和ARGO_AUTH两个变量其中之一为空即启用临时隧道，反之则使用固定隧道
 * 无需设置NEZHA_TLS,当哪吒端口为{443,8443,2096,2087,2083,2053}其中之一时，自动开启tls
@@ -144,6 +145,7 @@ bash <(curl -Ls https://github.com/eooce/Sing-box/releases/download/00/00_vm.sh)
   | HY2_PORT     | 否 |        | hy2端口,支持多端口的玩具可以填写，不填写该节点不通             |
   | REALITY_PORT | 否 |        | vless-reality端口，支持多端口的玩具可以填写，不填写该节点不通   |
   | TUIC_PORT    | 否 |        | tuic-v5端口，支持多端口的玩具可以填写，不填写该节点不通         |
+  | SS_PORT      | 否 |        | Shadowsocks直连端口，支持多端口的玩具可以填写，密钥由 UUID 派生 |
 
 ## 游戏机hostong节点输出
 * 输出sub.txt节点文件，可直接导入V2ray，nekbox，小火箭等代理软中
