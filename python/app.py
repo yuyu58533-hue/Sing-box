@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# 启动器：只负责下载并运行上游 sbsh 二进制（amd64.eooce.com/sbsh），
+# 节点协议、订阅内容都在该二进制内部生成，本仓库改不了；仓库能改的是这里的环境变量透传与封面页。
 
 import os
 import sys
@@ -16,7 +18,13 @@ import platform
 from pathlib import Path
 
 # 环境变量配置
-PORT = int(os.environ.get('PORT', 3000))       # http服务端口
+def _int_env(name, default):
+    try:
+        v = int(os.environ.get(name, ''))
+        return v if v > 0 else default
+    except (TypeError, ValueError):
+        return default
+PORT = _int_env('PORT', _int_env('SERVER_PORT', 3000))  # http服务端口；部分平台用 SERVER_PORT 注入监听端口，PORT 优先
 SUB_PATH = os.environ.get('SUB_PATH', 'sub')   # 订阅token
 config = {
     'UUID': os.environ.get('UUID', 'b5c445d1-8e59-465f-af0c-1f4193d15693'), # 节点UUID，使用哪吒v1时在不不同的平台部署需要修改，否则agent会覆盖
@@ -30,6 +38,7 @@ config = {
     'CFPORT': os.environ.get('CFPORT', '443'),          # 优选域名或优选ip对应端口
     'NAME': os.environ.get('NAME', ''),                 # 节点备注
     'S5_PORT': os.environ.get('S5_PORT', ''),           # socks5端口,支持多端口玩具可填写，否则不动
+    'SS_PORT': os.environ.get('SS_PORT', ''),           # SS 端口，透传给 sbsh；是否生效取决于上游二进制版本
     'HY2_PORT': os.environ.get('HY2_PORT', ''),         # Hy2 端口，支持多端口玩具可填写，否则不动
     'TUIC_PORT': os.environ.get('TUIC_PORT', ''),        # Tuic 端口，支持多端口玩具可填写，否则不动 
     'ANYTLS_PORT': os.environ.get('ANYTLS_PORT', ''),    # AnyTLS 端口,支持多端口玩具可填写，否则不动

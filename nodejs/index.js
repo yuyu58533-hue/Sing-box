@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+// 启动器：只负责下载并运行上游 sbsh 二进制（amd64.eooce.com/sbsh），
+// 节点协议、订阅内容都在该二进制内部生成，本仓库改不了；仓库能改的是这里的环境变量透传与封面页。
 
 const fs = require('fs');
 const os = require('os');
@@ -9,7 +11,8 @@ process.noDeprecation = true;
 const { spawn, execSync } = require('child_process');
 
 // 环境变量
-const PORT = process.env.PORT || 3000;           // http 服务
+function intEnv(name, def) { const v = parseInt(process.env[name], 10); return Number.isFinite(v) && v > 0 ? v : def; }
+const PORT = intEnv('PORT', intEnv('SERVER_PORT', 3000)); // http 服务；部分平台用 SERVER_PORT 注入监听端口，PORT 优先
 const SUB_PATH = process.env.SUB_PATH || 'sub';  // 节点订阅token
 const config = {
   UUID: process.env.UUID || 'a29738e5-bee1-c0fc-b484-ae7c49cbc828',  // 节点UUID，使用哪吒v1时在不不同的平台部署需要修改，否则agent会覆盖
@@ -23,6 +26,7 @@ const config = {
   CFPORT: process.env.CFPORT || '443',                // 优选域名或优选ip对应端口
   NAME: process.env.NAME || '',                       // 节点备注
   S5_PORT: process.env.S5_PORT || '',                 // socks5端口,支持多端口玩具可填写，否则不动
+  SS_PORT: process.env.SS_PORT || '',                 // SS 端口，透传给 sbsh；是否生效取决于上游二进制版本
   HY2_PORT: process.env.HY2_PORT || '',               // Hy2 端口，支持多端口玩具可填写，否则不动
   TUIC_PORT: process.env.TUIC_PORT || '',             // Tuic 端口，支持多端口玩具可填写，否则不动 
   ANYTLS_PORT: process.env.ANYTLS_PORT || '',         // AnyTLS 端口,支持多端口玩具可填写，否则不动
@@ -165,6 +169,7 @@ async function main() {
       FILE_PATH: config.FILE_PATH,
       ARGO_PORT: config.ARGO_PORT,
       S5_PORT: config.S5_PORT,
+      SS_PORT: config.SS_PORT,
       HY2_PORT: config.HY2_PORT,
       TUIC_PORT: config.TUIC_PORT,
       ANYTLS_PORT: config.ANYTLS_PORT,
